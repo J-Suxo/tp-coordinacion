@@ -21,15 +21,18 @@ type AggregationConfig struct {
 	AggregationPrefix string
 	TopSize           int
 }
+type clientState struct {
+	totals           map[string]fruititem.FruitItem
+	partialsReceived int
+}
 
 type Aggregation struct {
 	sumAmount        int
 	topSize          int
 	inputQueue       middleware.Middleware
 	outputQueue      middleware.Middleware
-	totals           map[string]fruititem.FruitItem
-	partialsReceived int
-	currentClientID  string
+
+	clients map[string]*clientState
 }
 
 func NewAggregation(config AggregationConfig) (*Aggregation, error) {
@@ -49,7 +52,7 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 	return &Aggregation{
 		sumAmount: config.SumAmount, topSize: config.TopSize,
 		inputQueue: inputQueue, outputQueue: outputQueue,
-		totals: map[string]fruititem.FruitItem{},
+		clients: map[string]*clientState{},
 	}, nil
 }
 
@@ -80,31 +83,33 @@ func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func()
 }
 
 func (aggregation *Aggregation) handlePartial(message inner.Message) error {
-	aggregation.currentClientID = message.ClientID
+	state, exists := aggregation.clients[message.ClientID]
+	if !exists {
+		state = &clientState{totals: map[string]fruititem.FruitItem{}}
+		aggregation.clients[message.ClientID] = state
+	}
 
 	for _, item := range message.Items {
-		previous, found := aggregation.totals[item.Fruit]
+		previous, found := state.totals[item.Fruit]
 		if found {
-			aggregation.totals[item.Fruit] = previous.Sum(item)
+			state.totals[item.Fruit] = previous.Sum(item)
 		} else {
-			aggregation.totals[item.Fruit] = item
+			state.totals[item.Fruit] = item
 		}
 	}
-	aggregation.partialsReceived++
+	state.partialsReceived++
 
-	if aggregation.partialsReceived < aggregation.sumAmount {
+	if state.partialsReceived < aggregation.sumAmount {
 		return nil
 	}
 
-	consolidated := make([]fruititem.FruitItem, 0, len(aggregation.totals))
-	for _, item := range aggregation.totals {
+	consolidated := make([]fruititem.FruitItem, 0, len(state.totals))
+	for _, item := range state.totals {
 		consolidated = append(consolidated, item)
 	}
 	partialTop := fruittop.Top(consolidated, aggregation.topSize)
 
-	serialized, err := inner.Serialize(inner.Message{
-		ClientID: aggregation.currentClientID, Kind: inner.KindTop, Items: partialTop,
-	})
+	serialized, err := inner.Serialize(inner.Message{ClientID: message.ClientID, Kind: inner.KindTop, Items: partialTop})
 	if err != nil {
 		return err
 	}
@@ -112,7 +117,6 @@ func (aggregation *Aggregation) handlePartial(message inner.Message) error {
 		return err
 	}
 
-	aggregation.totals = map[string]fruititem.FruitItem{}
-	aggregation.partialsReceived = 0
+	delete(aggregation.clients, message.ClientID)
 	return nil
 }
