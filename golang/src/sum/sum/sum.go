@@ -2,13 +2,16 @@ package sum
 
 import (
 	"fmt"
-	"hash/fnv"
-	"log/slog"
-
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/middleware"
+	"hash/fnv"
+	"log/slog"
+	"slices"
+	"time"
 )
+
+const eofRedeliveryDelay = 10 * time.Millisecond
 
 type SumConfig struct {
 	Id                int
@@ -23,9 +26,11 @@ type SumConfig struct {
 
 type Sum struct {
 	id                int
+	sumAmount         int
 	aggregationAmount int
 
 	inputQueue        middleware.Middleware
+	eofResendQueue    middleware.Middleware
 	aggregationQueues []middleware.Middleware
 
 	totalsByClient map[string]map[string]fruititem.FruitItem
@@ -36,6 +41,7 @@ func NewSum(config SumConfig) (*Sum, error) {
 
 	sum := &Sum{
 		id:                config.Id,
+		sumAmount:         config.SumAmount,
 		aggregationAmount: config.AggregationAmount,
 		totalsByClient:    map[string]map[string]fruititem.FruitItem{},
 	}
@@ -45,6 +51,12 @@ func NewSum(config SumConfig) (*Sum, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	sum.eofResendQueue, err = middleware.CreateQueueMiddleware(config.InputQueue, connSettings)
+	if err != nil {
+		return nil, err
+	}
+
 	for i := 0; i < config.AggregationAmount; i++ {
 		queueName := fmt.Sprintf("%s_%d", config.AggregationPrefix, i)
 		queue, err := middleware.CreateQueueMiddleware(queueName, connSettings)
@@ -102,7 +114,29 @@ func (sum *Sum) handleData(message inner.Message) {
 }
 
 func (sum *Sum) handleEOF(eof inner.Message) error {
-	return sum.flushClient(eof.ClientID)
+	alreadySeen := slices.Contains(eof.SeenBy, sum.id)
+
+	if !alreadySeen {
+		if err := sum.flushClient(eof.ClientID); err != nil {
+			return err
+		}
+		eof.SeenBy = append(eof.SeenBy, sum.id)
+		slog.Info("EOF procesado", "client", short(eof.ClientID), "sums_que_lo_vieron", len(eof.SeenBy), "de", sum.sumAmount)
+	}
+
+	if len(eof.SeenBy) >= sum.sumAmount {
+		return nil
+	}
+
+	if alreadySeen {
+		time.Sleep(eofRedeliveryDelay)
+	}
+
+	serialized, err := inner.Serialize(eof)
+	if err != nil {
+		return err
+	}
+	return sum.eofResendQueue.Send(*serialized)
 }
 
 func (sum *Sum) flushClient(clientID string) error {
@@ -128,4 +162,11 @@ func aggregationFor(clientID string, fruit string, aggregationAmount int) int {
 	hasher := fnv.New32a()
 	_, _ = hasher.Write([]byte(clientID + "|" + fruit))
 	return int(hasher.Sum32() % uint32(aggregationAmount))
+}
+
+func short(clientID string) string {
+	if len(clientID) > 8 {
+		return clientID[:8]
+	}
+	return clientID
 }
