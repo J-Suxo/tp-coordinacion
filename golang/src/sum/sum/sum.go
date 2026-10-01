@@ -2,6 +2,10 @@ package sum
 
 import (
 	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
+
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/middleware"
@@ -69,15 +73,35 @@ func NewSum(config SumConfig) (*Sum, error) {
 }
 
 func (sum *Sum) Run() error {
+	defer sum.Close()
+	go sum.handleSIGTERM()
 	return sum.inputQueue.StartConsuming(func(msg middleware.Message, ack func(), nack func()) {
 		sum.handleMessage(msg, ack, nack)
 	})
+}
+func (sum *Sum) Close() {
+	allqueues := append([]middleware.Middleware{sum.inputQueue, sum.eofResendQueue},
+		sum.aggregationQueues...,
+	)
+	for _, queue := range allqueues{
+		queue.Close()
+	}
+}
+func (sum *Sum) handleSIGTERM() {
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	<-sigs
+	slog.Info("SIGTERM signal received")
+	err := sum.inputQueue.StopConsuming()
+	if err != nil {
+		slog.Error("Lost connection to middleware", "err", err)
+	}
 }
 
 func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
 	message, err := inner.Deserialize(&msg)
 	if err != nil {
-		slog.Error("Descartando mensaje inválido", "err", err)
+		slog.Error("Discarding invalid message", "err", err)
 		ack()
 		return
 	}
@@ -87,12 +111,12 @@ func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
 		sum.handleData(message)
 	case inner.KindEOF:
 		if err := sum.handleEOF(message); err != nil {
-			slog.Error("Al procesar el EOF de un cliente", "client", message.ClientID, "err", err)
+			slog.Error("Failed to process client EOF", "client", message.ClientID, "err", err)
 			nack()
 			return
 		}
 	default:
-		slog.Warn("Tipo de mensaje inesperado en Sum", "kind", message.Kind)
+		slog.Warn("Unexpected message type in Sum", "kind", message.Kind)
 	}
 	ack()
 }
@@ -121,7 +145,7 @@ func (sum *Sum) handleEOF(eof inner.Message) error {
 			return err
 		}
 		eof.SeenBy = append(eof.SeenBy, sum.id)
-		slog.Info("EOF procesado", "client", short(eof.ClientID), "sums_que_lo_vieron", len(eof.SeenBy), "de", sum.sumAmount)
+		slog.Info("EOF processed", "client", short(eof.ClientID), "sums_that_saw_it", len(eof.SeenBy), "of", sum.sumAmount)
 	}
 
 	if len(eof.SeenBy) >= sum.sumAmount {

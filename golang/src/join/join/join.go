@@ -2,6 +2,9 @@ package join
 
 import (
 	"log/slog"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruittop"
@@ -57,25 +60,45 @@ func NewJoin(config JoinConfig) (*Join, error) {
 }
 
 func (join *Join) Run() error {
+	defer join.Close()
+	go join.handleSIGTERM()
 	return join.inputQueue.StartConsuming(func(msg middleware.Message, ack func(), nack func()) {
 		join.handleMessage(msg, ack, nack)
 	})
 }
 
+func (join *Join) Close() {
+	allqueues := []middleware.Middleware{join.inputQueue, join.outputQueue}
+	for _, queue := range allqueues {
+		queue.Close()
+	}
+}
+func (join *Join) handleSIGTERM() {
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	<-sigs
+	slog.Info("SIGTERM signal received")
+
+	err := join.inputQueue.StopConsuming()
+	if err != nil {
+		slog.Error("Lost connection to middleware", "err", err)
+	}
+}
+
 func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func()) {
 	message, err := inner.Deserialize(&msg)
 	if err != nil {
-		slog.Error("Descartando mensaje inválido", "err", err)
+		slog.Error("Discarding invalid message", "err", err)
 		ack()
 		return
 	}
 	if message.Kind != inner.KindTop {
-		slog.Warn("Tipo de mensaje inesperado en Join", "kind", message.Kind)
+		slog.Warn("Unexpected message type in Join", "kind", message.Kind)
 		ack()
 		return
 	}
 	if err := join.handleTop(message); err != nil {
-		slog.Error("Al procesar un top parcial", "client", message.ClientID, "err", err)
+		slog.Error("Failed to process partial top", "client", message.ClientID, "err", err)
 		nack()
 		return
 	}

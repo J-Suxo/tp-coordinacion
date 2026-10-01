@@ -16,7 +16,7 @@ type MessageHandler struct {
 func newClientID() string {
 	var bytes [16]byte
 	if _, err := rand.Read(bytes[:]); err != nil {
-		panic("no se pudo generar el ID del cliente: " + err.Error())
+		panic("failed to generate client ID: " + err.Error())
 	}
 	return hex.EncodeToString(bytes[:])
 }
